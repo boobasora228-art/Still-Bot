@@ -1,315 +1,384 @@
 import os
-import tempfile
-import threading
 import logging
-import sys
-import time
-from PIL import Image
+import pyttsx3
+import win32com.client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
-from telegram.request import HTTPXRequest
-
-# --- Настройка окружения ---
-os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".huggingface"))
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # --- Конфигурация ---
-MODEL_ID = "stabilityai/sd-turbo"
-TOKEN = os.environ.get("TELEGRAM_TOKEN") or "8659191729:AAFn0J4c5TLcwEIFpiM49Ln7-idqb3mJPyc"
-
-# Токены для искажения
-DISMOORPH_PROMPTS = [
-    "the same image, the same scene, the same subject, photorealistic, recreate it faithfully, subtle imperfections, readable text",
-    "the same image, the same scene, photorealistic, slightly warped, imperfect edges, faint duplicated details, slightly misspelled text",
-    "the same image, the same scene, recreated imperfectly, extra eyes and mouths, duplicated features, garbled text, missing letters, misspelled words",
-    "the same scene, recreated badly, many extra eyes and mouths, multiplied objects, scrambled letters, jumbled words, gibberish text, melting, uncanny",
-    "the same scene emptied, background stripped bare, distorted figure, empty walls, scrambled lettering, broken mangled objects, minimal, plain",
-    "an empty room, bare walls, an empty cube, featureless, blank, nothing inside",
-]
-FLATTEN_PROMPT = "an empty room, an empty cube, bare walls, nothing inside, blank, featureless, minimal"
+TOKEN = "8659191729:AAFn0J4c5TLcwEIFpiM49Ln7-idqb3mJPyc"
 
 # --- Логирование ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Глобальные переменные ---
-pipe = None
-model_ready = False
-processing = False
-stats = {'processed': 0, 'errors': 0, 'start_time': time.time()}
-_device = "cpu"
-_lock = threading.Lock()
-
-
-def init_device():
-    """Инициализация устройства"""
-    global _device
-    try:
-        import torch
-        if torch.cuda.is_available():
-            _device = "cuda"
-            logger.info("Using GPU (CUDA)")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            _device = "mps"
-            logger.info("Using Apple GPU (MPS)")
-        else:
-            _device = "cpu"
-            logger.info("Using CPU")
-    except Exception as e:
-        logger.warning(f"Device detection error: {e}, using CPU")
-        _device = "cpu"
-
-
-def load_model():
-    """Загрузка модели"""
-    global pipe, model_ready
-    try:
-        from diffusers import AutoPipelineForImage2Image
-        import torch
+# --- Класс для работы с SAPI 5 ---
+class Sapi5TTS:
+    def __init__(self):
+        self.engine = None
+        self.voices = []
+        self.voice_names = []
+        self.current_voice = 0
+        self.rate = 200
+        self.volume = 1.0
+        self.init_engine()
+        self.list_voices()
         
-        logger.info(f"Loading model on {_device}...")
-        pipe = AutoPipelineForImage2Image.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.float16 if _device == "cuda" else torch.float32,
-            safety_checker=None,
-            requires_safety_checker=False,
-            low_cpu_mem_usage=True
-        )
-        pipe.to(_device)
+    def init_engine(self):
+        """Инициализация SAPI 5"""
+        try:
+            self.engine = pyttsx3.init('sapi5')
+            self.voices = self.engine.getProperty('voices')
+            logger.info(f"SAPI 5 инициализирован, найдено {len(self.voices)} голосов")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации: {e}")
+            try:
+                # Альтернативный способ
+                self.engine = win32com.client.Dispatch("SAPI.SpVoice")
+                self.voices = self.engine.GetVoices()
+                logger.info(f"SAPI через win32com, найдено {self.voices.Count} голосов")
+            except Exception as e2:
+                logger.error(f"Критическая ошибка: {e2}")
+                self.engine = None
+                
+    def list_voices(self):
+        """Список доступных голосов"""
+        self.voice_names = []
+        if self.engine is None:
+            return
+            
+        try:
+            if hasattr(self.engine, 'getProperty'):
+                # pyttsx3
+                for i, voice in enumerate(self.voices):
+                    name = voice.name
+                    self.voice_names.append(name)
+                    logger.info(f"Голос {i}: {name}")
+            else:
+                # win32com
+                for i in range(self.voices.Count):
+                    name = self.voices[i].GetDescription()
+                    self.voice_names.append(name)
+                    logger.info(f"Голос {i}: {name}")
+        except Exception as e:
+            logger.error(f"Ошибка получения списка голосов: {e}")
+            
+    def set_voice(self, index):
+        """Установка голоса по индексу"""
+        if self.engine is None:
+            return False
+            
+        try:
+            if hasattr(self.engine, 'setProperty'):
+                # pyttsx3
+                if index < len(self.voices):
+                    self.engine.setProperty('voice', self.voices[index].id)
+                    self.current_voice = index
+                    return True
+            else:
+                # win32com
+                if index < self.voices.Count:
+                    self.engine.Voice = self.voices[index]
+                    self.current_voice = index
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка установки голоса: {e}")
+            return False
+            
+    def set_voice_by_name(self, name):
+        """Установка голоса по имени"""
+        for i, voice_name in enumerate(self.voice_names):
+            if name.lower() in voice_name.lower():
+                return self.set_voice(i)
+        return False
         
-        if _device == "cuda":
-            pipe.enable_attention_slicing()
-            pipe.enable_model_cpu_offload()
-        
-        model_ready = True
-        logger.info("Model loaded successfully!")
-        
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        model_ready = False
-        pipe = None
+    def speak(self, text):
+        """Озвучивание текста"""
+        if self.engine is None:
+            logger.error("TTS двигатель не инициализирован")
+            return False
+            
+        try:
+            logger.info(f"Озвучиваю: {text}")
+            
+            if hasattr(self.engine, 'setProperty'):
+                # pyttsx3
+                self.engine.setProperty('rate', self.rate)
+                self.engine.setProperty('volume', self.volume)
+                self.engine.say(text)
+                self.engine.runAndWait()
+            else:
+                # win32com
+                self.engine.Rate = self.rate // 10
+                self.engine.Volume = int(self.volume * 100)
+                self.engine.Speak(text)
+                
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка озвучивания: {e}")
+            return False
+
+    def get_voices_list(self):
+        """Получить список голосов для кнопок"""
+        buttons = []
+        row = []
+        for i, name in enumerate(self.voice_names):
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+            # Сокращаем длинные имена
+            display_name = name[:20] + "..." if len(name) > 20 else name
+            row.append(InlineKeyboardButton(display_name, callback_data=f"voice_{i}"))
+        if row:
+            buttons.append(row)
+        return buttons
 
 
-def dismorph_plan(intensity):
-    """План искажений"""
-    eff = intensity * 0.7
-    passes = max(1, int(round(eff * 8)))
-    strength = 0.35 + (eff ** 1.2) * 0.45
-    if eff >= 0.5:
-        flatten = min(0.8, 0.5 + eff * 0.3)
-    elif eff >= 0.35:
-        flatten = 0.3 + eff * 0.35
-    else:
-        flatten = None
-    return passes, strength, flatten
+# --- Создаем экземпляр TTS ---
+tts = Sapi5TTS()
 
 
-def process_image(image_path, intensity):
-    """Обработка изображения"""
-    global pipe, model_ready, stats
-    
-    if not model_ready:
-        raise Exception("Model is not loaded. Contact administrator.")
-        
-    try:
-        with _lock:
-            init = Image.open(image_path).convert("RGB")
-            w, h = init.size
-            ratio = 512 / max(w, h)
-            nw, nh = max(64, int((w * ratio) / 64) * 64), max(64, int((h * ratio) / 64) * 64)
-            current = init.resize((nw, nh), Image.Resampling.LANCZOS)
-
-            passes, strength, flatten_strength = dismorph_plan(intensity)
-
-            for i in range(passes):
-                depth = i / passes
-                idx = min(len(DISMOORPH_PROMPTS) - 1, int(depth * len(DISMOORPH_PROMPTS)))
-                current = pipe(
-                    DISMOORPH_PROMPTS[idx],
-                    image=current,
-                    strength=strength,
-                    num_inference_steps=8,
-                    guidance_scale=0.0
-                ).images[0]
-
-            if flatten_strength is not None:
-                current = pipe(
-                    FLATTEN_PROMPT,
-                    image=current,
-                    strength=flatten_strength,
-                    num_inference_steps=8,
-                    guidance_scale=0.0
-                ).images[0]
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                current.save(tmp.name)
-                stats['processed'] += 1
-                return tmp.name
-
-    except Exception as e:
-        logger.error(f"Processing error: {e}")
-        stats['errors'] += 1
-        raise
-
-
-# --- Команды ---
+# --- Обработчики команд ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    keyboard = [
+        [InlineKeyboardButton("🎤 Озвучить сообщение", callback_data="speak")],
+        [InlineKeyboardButton("🎵 Настройки голоса", callback_data="settings")],
+        [InlineKeyboardButton("📋 Список голосов", callback_data="list_voices")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "Still Life Generator Bot\n\n"
-        "Send a photo to generate distorted still life.\n\n"
-        "Commands:\n"
-        "/stilllife - generate distorted image\n"
-        "/status - check bot status\n"
-        "/help - show all commands"
+        "🤖 Голосовой ассистент SAPI 5\n\n"
+        "Отправь мне текст, и я озвучу его через SAPI 5.\n"
+        "Или используй кнопки ниже:\n\n"
+        f"Текущий голос: {tts.voice_names[tts.current_voice] if tts.voice_names else 'Неизвестно'}\n"
+        f"Скорость: {tts.rate}\n"
+        f"Громкость: {int(tts.volume * 100)}%",
+        reply_markup=reply_markup
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help"""
     await update.message.reply_text(
-        "Commands:\n\n"
-        "/stilllife [level] - Generate distorted image\n"
-        "   Level: 1-100 (1=minimal, 100=maximum)\n"
-        "/status - Check bot status\n"
-        "/help - Show this help\n\n"
-        "How to use:\n"
-        "1. Send a photo\n"
-        "2. Add caption: /stilllife 50\n"
-        "3. Or use buttons after sending photo"
+        "📖 Помощь:\n\n"
+        "Просто отправь мне текст - я озвучу его.\n\n"
+        "Команды:\n"
+        "/start - Главное меню\n"
+        "/help - Помощь\n"
+        "/voices - Список голосов\n"
+        "/voice [номер] - Выбрать голос\n"
+        "/rate [число] - Скорость (100-300)\n"
+        "/volume [0-100] - Громкость\n"
+        "/speak [текст] - Озвучить текст"
     )
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uptime = int(time.time() - stats['start_time'])
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
-    
-    status_text = f"Bot Status:\n\n"
-    status_text += f"Model: {'✅ Loaded' if model_ready else '❌ Not loaded'}\n"
-    status_text += f"Device: {_device.upper()}\n"
-    status_text += f"Processing: {'⏳ Yes' if processing else '⏸ No'}\n"
-    status_text += f"Uptime: {hours}h {minutes}m\n"
-    status_text += f"Images processed: {stats['processed']}\n"
-    status_text += f"Errors: {stats['errors']}"
-    
-    await update.message.reply_text(status_text)
-
-
-async def stilllife_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global processing
-    
-    if not update.message.photo:
-        await update.message.reply_text("Please send a photo with the command!\nExample: /stilllife 50")
+async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /voices - показать список голосов"""
+    if not tts.voice_names:
+        await update.message.reply_text("❌ Голоса не найдены")
         return
+        
+    text = "📋 Доступные голоса:\n\n"
+    for i, name in enumerate(tts.voice_names):
+        marker = "👉 " if i == tts.current_voice else "   "
+        text += f"{marker} {i}: {name}\n"
     
-    if not model_ready:
-        await update.message.reply_text("Model is loading... Please wait a moment.")
-        return
+    text += f"\nТекущий голос: {tts.voice_names[tts.current_voice]}"
     
-    if processing:
-        await update.message.reply_text("Please wait, processing another image...")
-        return
-    
-    level = 50
-    if context.args:
-        try:
-            level = int(context.args[0])
-            level = max(1, min(100, level))
-        except:
-            level = 50
-    
-    await update.message.reply_text(f"Processing with level {level}%...")
-    
-    photo_file = await update.message.photo[-1].get_file()
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        await photo_file.download_to_drive(tmp.name)
-        input_path = tmp.name
-    
-    processing = True
-    
-    def process_thread():
-        try:
-            output_path = process_image(input_path, level / 100)
-            
-            with open(output_path, 'rb') as f:
-                context.bot.send_photo(
-                    chat_id=update.message.chat.id,
-                    photo=f,
-                    caption=f"Done! Level: {level}%"
-                )
-            
-            try:
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-                if os.path.exists(input_path):
-                    os.unlink(input_path)
-            except:
-                pass
-            
-        except Exception as e:
-            context.bot.send_message(
-                chat_id=update.message.chat.id,
-                text=f"Error: {e}"
-            )
-            try:
-                if os.path.exists(input_path):
-                    os.unlink(input_path)
-            except:
-                pass
-        finally:
-            global processing
-            processing = False
-    
-    threading.Thread(target=process_thread, daemon=True).start()
+    await update.message.reply_text(text)
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Photo received!\n"
-        "Use /stilllife with photo to generate distorted image.\n"
-        "Example: /stilllife 50"
-    )
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /voice [номер] - выбрать голос"""
+    if not context.args:
+        await update.message.reply_text("❌ Укажите номер голоса. Пример: /voice 2")
+        return
+        
+    try:
+        index = int(context.args[0])
+        if tts.set_voice(index):
+            await update.message.reply_text(f"✅ Голос изменён на: {tts.voice_names[index]}")
+        else:
+            await update.message.reply_text(f"❌ Голос с номером {index} не найден")
+    except ValueError:
+        await update.message.reply_text("❌ Введите число. Пример: /voice 2")
+
+
+async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /rate [число] - скорость речи"""
+    if not context.args:
+        await update.message.reply_text(f"Текущая скорость: {tts.rate}. /rate [100-300]")
+        return
+        
+    try:
+        rate = int(context.args[0])
+        rate = max(50, min(300, rate))
+        tts.rate = rate
+        await update.message.reply_text(f"✅ Скорость изменена: {rate}")
+    except ValueError:
+        await update.message.reply_text("❌ Введите число. Пример: /rate 200")
+
+
+async def volume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /volume [0-100] - громкость"""
+    if not context.args:
+        await update.message.reply_text(f"Текущая громкость: {int(tts.volume * 100)}%. /volume [0-100]")
+        return
+        
+    try:
+        volume = int(context.args[0])
+        volume = max(0, min(100, volume))
+        tts.volume = volume / 100
+        await update.message.reply_text(f"✅ Громкость изменена: {volume}%")
+    except ValueError:
+        await update.message.reply_text("❌ Введите число. Пример: /volume 80")
+
+
+async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /speak [текст] - озвучить текст"""
+    if not context.args:
+        await update.message.reply_text("❌ Введите текст. Пример: /speak Привет мир!")
+        return
+        
+    text = " ".join(context.args)
+    await update.message.reply_text(f"🔊 Озвучиваю: {text}")
+    
+    # Озвучиваем в отдельном потоке, чтобы не блокировать бота
+    import threading
+    def speak_thread():
+        tts.speak(text)
+    threading.Thread(target=speak_thread, daemon=True).start()
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений"""
+    text = update.message.text
+    
+    # Проверяем, не команда ли это
+    if text.startswith('/'):
+        return
+        
+    # Отвечаем, что озвучиваем
+    await update.message.reply_text(f"🔊 Озвучиваю: {text[:50]}...")
+    
+    # Озвучиваем в отдельном потоке
+    import threading
+    def speak_thread():
+        tts.speak(text)
+    threading.Thread(target=speak_thread, daemon=True).start()
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок"""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Feature coming soon!")
+    
+    data = query.data
+    
+    if data == "speak":
+        await query.edit_message_text(
+            "✏️ Отправь мне текст, и я озвучу его!\n"
+            "Или используй команду /speak [текст]"
+        )
+        
+    elif data == "settings":
+        keyboard = [
+            [InlineKeyboardButton("➕ Скорость +10", callback_data="rate_up")],
+            [InlineKeyboardButton("➖ Скорость -10", callback_data="rate_down")],
+            [InlineKeyboardButton("➕ Громкость +10%", callback_data="volume_up")],
+            [InlineKeyboardButton("➖ Громкость -10%", callback_data="volume_down")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🎵 Настройки голоса:\n\n"
+            f"Текущий голос: {tts.voice_names[tts.current_voice] if tts.voice_names else 'Неизвестно'}\n"
+            f"Скорость: {tts.rate}\n"
+            f"Громкость: {int(tts.volume * 100)}%",
+            reply_markup=reply_markup
+        )
+        
+    elif data == "list_voices":
+        if not tts.voice_names:
+            await query.edit_message_text("❌ Голоса не найдены")
+            return
+            
+        text = "📋 Доступные голоса:\n\n"
+        for i, name in enumerate(tts.voice_names):
+            marker = "👉 " if i == tts.current_voice else "   "
+            text += f"{marker} {i}: {name}\n"
+        
+        text += f"\nТекущий: {tts.voice_names[tts.current_voice]}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup)
+        
+    elif data.startswith("voice_"):
+        try:
+            index = int(data.split("_")[1])
+            if tts.set_voice(index):
+                await query.edit_message_text(
+                    f"✅ Голос изменён!\n\n"
+                    f"Новый голос: {tts.voice_names[index]}"
+                )
+            else:
+                await query.edit_message_text(f"❌ Ошибка установки голоса")
+        except:
+            await query.edit_message_text("❌ Ошибка")
+            
+    elif data == "rate_up":
+        tts.rate = min(300, tts.rate + 10)
+        await query.edit_message_text(f"✅ Скорость: {tts.rate}")
+        
+    elif data == "rate_down":
+        tts.rate = max(50, tts.rate - 10)
+        await query.edit_message_text(f"✅ Скорость: {tts.rate}")
+        
+    elif data == "volume_up":
+        tts.volume = min(1.0, tts.volume + 0.1)
+        await query.edit_message_text(f"✅ Громкость: {int(tts.volume * 100)}%")
+        
+    elif data == "volume_down":
+        tts.volume = max(0, tts.volume - 0.1)
+        await query.edit_message_text(f"✅ Громкость: {int(tts.volume * 100)}%")
+        
+    elif data == "back":
+        await start(update, context)
 
 
 def main():
-    global model_ready
-    
+    """Запуск бота"""
     try:
-        # Инициализация
-        init_device()
-        
-        # Загрузка модели
-        load_model()
-        
         # Создаем приложение
-        request = HTTPXRequest(
-            connection_pool_size=8,
-            connect_timeout=60.0,
-            read_timeout=120.0,
-            write_timeout=60.0,
-            pool_timeout=60.0
-        )
+        application = Application.builder().token(TOKEN).build()
         
-        application = Application.builder().token(TOKEN).request(request).build()
-        
+        # Регистрируем обработчики
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("status", status_command))
-        application.add_handler(CommandHandler("stilllife", stilllife_command))
-        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        application.add_handler(CommandHandler("voices", voices_command))
+        application.add_handler(CommandHandler("voice", voice_command))
+        application.add_handler(CommandHandler("rate", rate_command))
+        application.add_handler(CommandHandler("volume", volume_command))
+        application.add_handler(CommandHandler("speak", speak_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
-        logger.info("Bot started!")
+        logger.info("🤖 Бот с SAPI 5 запущен!")
+        print("🤖 Бот с SAPI 5 запущен!")
+        print(f"Доступно голосов: {len(tts.voice_names)}")
+        print("Отправьте боту текст для озвучивания")
+        
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Ошибка: {e}")
         raise
 
 
