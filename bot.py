@@ -2,20 +2,22 @@ import os
 import tempfile
 import threading
 import logging
+import sys
 import time
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telegram.request import HTTPXRequest
 
-# --- Настройка окружения для модели ---
+# --- Настройка окружения ---
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".huggingface"))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # --- Конфигурация ---
 MODEL_ID = "stabilityai/sd-turbo"
-TOKEN = "8659191729:AAFn0J4c5TLcwEIFpiM49Ln7-idqb3mJPyc"
+TOKEN = os.environ.get("TELEGRAM_TOKEN") or "8659191729:AAFn0J4c5TLcwEIFpiM49Ln7-idqb3mJPyc"
 
-# Токены для разных уровней искажения
+# Токены для искажения
 DISMOORPH_PROMPTS = [
     "the same image, the same scene, the same subject, photorealistic, recreate it faithfully, subtle imperfections, readable text",
     "the same image, the same scene, photorealistic, slightly warped, imperfect edges, faint duplicated details, slightly misspelled text",
@@ -26,76 +28,76 @@ DISMOORPH_PROMPTS = [
 ]
 FLATTEN_PROMPT = "an empty room, an empty cube, bare walls, nothing inside, blank, featureless, minimal"
 
-# Настройка логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# --- Логирование ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 
 class StillLifeBot:
     def __init__(self):
         self.pipe = None
-        self._device = None
-        self._dtype = None
-        self._devices = None
+        self._device = "cpu"
         self.model_ready = False
         self._lock = threading.Lock()
-        self._downloading = False
         self._processing = False
+        self.stats = {
+            'total_processed': 0,
+            'total_errors': 0,
+            'start_time': time.time()
+        }
+        self._init_device()
+        self._load_model()
 
-    @property
-    def devices(self):
-        if self._devices is None:
-            self._devices = self._detect_devices()
-        return self._devices
-
-    @property
-    def device(self):
-        if self._device is None:
-            self._device = self.devices[0]
-        return self._device
-
-    @property
-    def dtype(self):
-        if self._dtype is None:
-            import torch
-            self._dtype = torch.float16 if self.device == "cuda" else torch.float32
-        return self._dtype
-
-    def _detect_devices(self):
-        devices = []
+    def _init_device(self):
+        """Инициализация устройства"""
         try:
             import torch
             if torch.cuda.is_available():
-                devices.append("cuda")
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                devices.append("mps")
-        except Exception:
-            pass
-        devices.append("cpu")
-        return devices
+                self._device = "cuda"
+                logger.info("Using GPU (CUDA)")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self._device = "mps"
+                logger.info("Using Apple GPU (MPS)")
+            else:
+                self._device = "cpu"
+                logger.info("Using CPU")
+        except Exception as e:
+            logger.warning(f"Device detection error: {e}, using CPU")
+            self._device = "cpu"
 
-    def _get_pipe(self):
-        if self.pipe is None:
-            try:
-                from diffusers import AutoPipelineForImage2Image
-                logger.info("Loading model...")
-                self.pipe = AutoPipelineForImage2Image.from_pretrained(
-                    MODEL_ID,
-                    torch_dtype=self.dtype,
-                    safety_checker=None,
-                    requires_safety_checker=False
-                )
-                self.pipe.to(self.device)
-                if self.device == "cuda":
-                    self.pipe.enable_attention_slicing()
-                self.model_ready = True
-                logger.info("Model loaded")
-            except Exception as e:
-                logger.error(f"Error loading model: {e}")
-                raise
-        return self.pipe
+    def _load_model(self):
+        """Загрузка модели при запуске"""
+        try:
+            from diffusers import AutoPipelineForImage2Image
+            import torch
+            
+            logger.info(f"Loading model on {self._device}...")
+            self.pipe = AutoPipelineForImage2Image.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.float16 if self._device == "cuda" else torch.float32,
+                safety_checker=None,
+                requires_safety_checker=False,
+                low_cpu_mem_usage=True
+            )
+            self.pipe.to(self._device)
+            
+            if self._device == "cuda":
+                self.pipe.enable_attention_slicing()
+                self.pipe.enable_model_cpu_offload()
+            
+            self.model_ready = True
+            logger.info("Model loaded successfully!")
+            
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            self.model_ready = False
+            self.pipe = None
 
     def _dismorph_plan(self, intensity):
+        """План искажений"""
         eff = intensity * 0.7
         passes = max(1, int(round(eff * 8)))
         strength = 0.35 + (eff ** 1.2) * 0.45
@@ -108,9 +110,13 @@ class StillLifeBot:
         return passes, strength, flatten
 
     def process_image(self, image_path, intensity):
+        """Обработка изображения"""
+        if not self.model_ready:
+            raise Exception("Model is not loaded. Contact administrator.")
+            
         try:
             with self._lock:
-                pipe = self._get_pipe()
+                pipe = self.pipe
                 
                 init = Image.open(image_path).convert("RGB")
                 w, h = init.size
@@ -142,45 +148,12 @@ class StillLifeBot:
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                     current.save(tmp.name)
+                    self.stats['total_processed'] += 1
                     return tmp.name
 
         except Exception as e:
             logger.error(f"Processing error: {e}")
-            raise
-
-    def check_model_exists(self):
-        try:
-            from huggingface_hub import hf_hub_download
-            hf_hub_download(MODEL_ID, "model_index.json", local_files_only=True)
-            return True
-        except Exception:
-            return False
-
-    def download_model(self):
-        from huggingface_hub import hf_hub_download, HfApi
-        
-        if self._downloading:
-            return False
-            
-        self._downloading = True
-        
-        try:
-            api = HfApi()
-            siblings = [s for s in api.model_info(MODEL_ID).siblings
-                       if not s.rfilename.endswith(".gitattributes")
-                       and not (s.rfilename.endswith(".safetensors") and "/" not in s.rfilename)]
-            
-            total = len(siblings)
-            for i, s in enumerate(siblings):
-                logger.info(f"Downloading {i+1}/{total}: {s.rfilename}")
-                hf_hub_download(MODEL_ID, s.rfilename, resume_download=True)
-            
-            self.model_ready = True
-            self._downloading = False
-            return True
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            self._downloading = False
+            self.stats['total_errors'] += 1
             raise
 
 
@@ -188,81 +161,133 @@ class StillLifeBot:
 bot_instance = StillLifeBot()
 
 
-# --- Обработчики команд ---
+# --- Проверка чата ---
+async def check_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка, добавлен ли бот в чат"""
+    chat = update.effective_chat
+    
+    # Если это личный чат с ботом - разрешаем
+    if chat.type == "private":
+        return True
+    
+    # Если это группа - проверяем, добавлен ли бот
+    try:
+        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        if bot_member.status in ["member", "administrator"]:
+            return True
+        else:
+            await update.message.reply_text(
+                "❗ Please add the bot to the chat first!\n"
+                "Добавьте бота в чат!"
+            )
+            return False
+    except:
+        await update.message.reply_text(
+            "❗ Please add the bot to the chat first!\n"
+            "Добавьте бота в чат!"
+        )
+        return False
+
+
+# --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    if not await check_group(update, context):
+        return
+        
     await update.message.reply_text(
-        "Still Life Generator Bot\n\n"
-        "Send a photo to generate distorted still life.\n"
+        "🤖 Still Life Generator Bot\n\n"
+        "Send a photo to generate distorted still life.\n\n"
         "Commands:\n"
-        "/start - show this message\n"
-        "/download - download model\n"
-        "/status - check model status"
+        "/stilllife - generate distorted image\n"
+        "/status - check bot status\n"
+        "/help - show all commands\n\n"
+        "Use /help for more information."
     )
 
 
-async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    
-    if bot_instance.model_ready:
-        await update.message.reply_text("Model is already loaded!")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help"""
+    if not await check_group(update, context):
         return
-    
-    if bot_instance._downloading:
-        await update.message.reply_text("Download is already in progress...")
-        return
-    
-    await update.message.reply_text("Starting model download (~1.5GB). This may take 10-30 minutes...")
-    
-    def download_thread():
-        try:
-            bot_instance.download_model()
-            # Используем синхронную отправку
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(
-                context.bot.send_message(
-                    chat_id=chat_id,
-                    text="Model downloaded successfully! Send a photo to process."
-                )
-            )
-            loop.close()
-        except Exception as e:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(
-                context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"Download error: {e}"
-                )
-            )
-            loop.close()
-    
-    thread = threading.Thread(target=download_thread, daemon=True)
-    thread.start()
+        
+    await update.message.reply_text(
+        "📖 Available commands:\n\n"
+        "/stilllife [photo] [level] - Generate distorted image\n"
+        "   Example: send photo with caption /stilllife 50\n"
+        "   Level: 1-100 (1=minimal, 100=maximum distortion)\n\n"
+        "/status - Check bot status and statistics\n"
+        "/help - Show this help message\n\n"
+        "How to use:\n"
+        "1. Send a photo\n"
+        "2. Add caption: /stilllife 50\n"
+        "3. Or use the buttons after sending photo"
+    )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if bot_instance.model_ready:
-        await update.message.reply_text(
-            f"Model is loaded\nDevice: {bot_instance.device.upper()}"
-        )
-    else:
-        await update.message.reply_text(
-            "Model is not loaded.\nUse /download to download it."
-        )
+    """Команда /status"""
+    if not await check_group(update, context):
+        return
+        
+    uptime = int(time.time() - bot_instance.stats['start_time'])
+    hours = uptime // 3600
+    minutes = (uptime % 3600) // 60
+    
+    status_text = f"📊 Bot Status:\n\n"
+    status_text += f"Model: {'✅ Loaded' if bot_instance.model_ready else '❌ Not loaded'}\n"
+    status_text += f"Device: {bot_instance._device.upper()}\n"
+    status_text += f"Processing: {'⏳ Yes' if bot_instance._processing else '⏸ No'}\n"
+    status_text += f"Uptime: {hours}h {minutes}m\n"
+    status_text += f"Images processed: {bot_instance.stats['total_processed']}\n"
+    status_text += f"Errors: {bot_instance.stats['total_errors']}"
+    
+    await update.message.reply_text(status_text)
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stilllife_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stilllife"""
+    if not await check_group(update, context):
+        return
+        
+    # Проверяем, есть ли фото
+    if not update.message.photo:
+        await update.message.reply_text(
+            "❌ Please send a photo with the command!\n"
+            "Example: /stilllife 50 (with photo)"
+        )
+        return
+    
+    # Проверяем уровень
+    level = 50  # По умолчанию
+    if context.args:
+        try:
+            level = int(context.args[0])
+            if level < 1:
+                level = 1
+            elif level > 100:
+                level = 100
+        except:
+            level = 50
+    
+    # Обрабатываем фото
+    await handle_photo(update, context, level)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, preset_level=None):
+    """Обработка фото"""
+    if not await check_group(update, context):
+        return
+        
     if not bot_instance.model_ready:
         await update.message.reply_text(
-            "Model is not loaded. Use /download to download it."
+            "❌ Model is not loaded.\n"
+            "Contact administrator: @kirill2286776"
         )
         return
     
     if bot_instance._processing:
-        await update.message.reply_text("Please wait, processing another image...")
+        await update.message.reply_text("⏳ Please wait, processing another image...")
         return
     
     try:
@@ -272,6 +297,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await photo_file.download_to_drive(tmp.name)
             context.user_data['input_image'] = tmp.name
         
+        # Если уровень указан в команде - используем его
+        if preset_level is not None:
+            await process_with_level(update, context, preset_level)
+            return
+        
+        # Иначе показываем кнопки
         keyboard = []
         row = []
         for i in range(1, 101, 10):
@@ -282,25 +313,78 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row:
             keyboard.append(row)
         
-        keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "Select distortion level (1 - minimal, 100 - maximum):",
+            "🎨 Select distortion level (1-100):",
             reply_markup=reply_markup
         )
+        
     except Exception as e:
         logger.error(f"Error handling photo: {e}")
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def process_with_level(update: Update, context: ContextTypes.DEFAULT_TYPE, level):
+    """Обработка с указанным уровнем"""
+    intensity = level / 100
+    chat_id = update.message.chat.id
+    
+    if 'input_image' not in context.user_data:
+        await update.message.reply_text("❌ Photo not found. Send image again.")
+        return
+    
+    await update.message.reply_text(f"⏳ Processing with distortion level {level}%...")
+    
+    input_path = context.user_data['input_image']
+    del context.user_data['input_image']
+    
+    bot_instance._processing = True
+    
+    def process_thread():
+        try:
+            output_path = bot_instance.process_image(input_path, intensity)
+            
+            with open(output_path, 'rb') as f:
+                context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=f,
+                    caption=f"✅ Done! Distortion level: {level}%"
+                )
+            
+            try:
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                if os.path.exists(input_path):
+                    os.unlink(input_path)
+            except:
+                pass
+            
+        except Exception as e:
+            context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Processing error: {e}"
+            )
+            try:
+                if os.path.exists(input_path):
+                    os.unlink(input_path)
+            except:
+                pass
+        finally:
+            bot_instance._processing = False
+    
+    threading.Thread(target=process_thread, daemon=True).start()
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок"""
     query = update.callback_query
     await query.answer()
     
     try:
         if query.data == "cancel":
-            await query.edit_message_text("Operation cancelled")
+            await query.edit_message_text("❌ Operation cancelled")
             if 'input_image' in context.user_data:
                 try:
                     os.unlink(context.user_data['input_image'])
@@ -310,14 +394,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         if query.data.startswith("intensity_"):
-            intensity = int(query.data.split("_")[1]) / 100
+            level = int(query.data.split("_")[1])
+            intensity = level / 100
             chat_id = query.message.chat.id
             
             if 'input_image' not in context.user_data:
-                await query.edit_message_text("Photo not found. Send image again.")
+                await query.edit_message_text("❌ Photo not found. Send image again.")
                 return
             
-            await query.edit_message_text(f"Processing photo with distortion level {int(intensity * 100)}%...")
+            await query.edit_message_text(f"⏳ Processing with distortion level {level}%...")
             
             input_path = context.user_data['input_image']
             del context.user_data['input_image']
@@ -328,23 +413,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     output_path = bot_instance.process_image(input_path, intensity)
                     
-                    # Отправляем результат синхронно
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
                     with open(output_path, 'rb') as f:
-                        loop.run_until_complete(
-                            context.bot.send_photo(
-                                chat_id=chat_id,
-                                photo=f,
-                                caption="Done! Result of distortion."
-                            )
+                        context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=f,
+                            caption=f"✅ Done! Distortion level: {level}%"
                         )
                     
-                    loop.close()
-                    
-                    # Удаляем временные файлы
                     try:
                         if os.path.exists(output_path):
                             os.unlink(output_path)
@@ -354,16 +429,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                     
                 except Exception as e:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(
-                        context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"Processing error: {e}"
-                        )
+                    context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Processing error: {e}"
                     )
-                    loop.close()
                     try:
                         if os.path.exists(input_path):
                             os.unlink(input_path)
@@ -372,22 +441,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 finally:
                     bot_instance._processing = False
             
-            thread = threading.Thread(target=process_thread, daemon=True)
-            thread.start()
+            threading.Thread(target=process_thread, daemon=True).start()
             
     except Exception as e:
         logger.error(f"Error in callback: {e}")
-        await query.edit_message_text(f"Error: {e}")
+        await query.edit_message_text(f"❌ Error: {e}")
 
 
 def main():
+    """Запуск бота"""
     try:
-        # Проверяем наличие модели при запуске
-        if bot_instance.check_model_exists():
-            bot_instance.model_ready = True
-            logger.info("Model found locally")
-        
-        # Создаём приложение с увеличенным таймаутом
         request = HTTPXRequest(
             connection_pool_size=8,
             connect_timeout=60.0,
@@ -400,8 +463,9 @@ def main():
         
         # Регистрируем обработчики
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("download", download_command))
+        application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("status", status_command))
+        application.add_handler(CommandHandler("stilllife", stilllife_command))
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
