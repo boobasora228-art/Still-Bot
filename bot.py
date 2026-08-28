@@ -5,7 +5,7 @@ import pythoncom
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 
-TOKEN = "8659191729:AAFn0J4c5TLcwEIFpiM49Ln7-idqb3mJPyc"
+TOKEN = "8716430991:AAF7h4RZNaNNfc1_X4ScSVeVp-jmwwq4JBs"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
