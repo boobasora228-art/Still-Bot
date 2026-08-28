@@ -1,20 +1,20 @@
 [project]
-name = "still-life-bot"
+name = "windows-tts-bot"
 version = "1.0.0"
-description = "Telegram bot for generating distorted still life images"
+description = "Telegram bot for Windows TTS with pyttsx3"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 dependencies = [
+    "pyttsx3>=2.90",
     "python-telegram-bot>=20.0",
-    "diffusers>=0.30.0",
-    "transformers>=4.46.0",
-    "pillow>=10.0.0",
-    "huggingface-hub>=0.26.0",
-    "accelerate>=1.1.0",
-    "safetensors>=0.4.0",
-    "numpy>=1.26.0",
 ]
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["bot"]
+
+[tool.setuptools.packages.find]
+where = ["."]
