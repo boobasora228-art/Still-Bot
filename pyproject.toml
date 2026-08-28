@@ -1,20 +1,13 @@
 [project]
-name = "windows-tts-bot"
+name = "tts-bot"
 version = "1.0.0"
-description = "Telegram bot for Windows TTS with pyttsx3"
-readme = "README.md"
+description = "Telegram bot for Windows TTS"
 requires-python = ">=3.8"
 dependencies = [
-    "pyttsx3>=2.90",
-    "python-telegram-bot>=20.0",
+    "pyttsx3==2.90",
+    "python-telegram-bot==20.7",
 ]
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-py-modules = ["bot"]
-
-[tool.setuptools.packages.find]
-where = ["."]
