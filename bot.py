@@ -116,6 +116,14 @@ class GoogleTTSBot:
             return True
         return False
     
+    def set_lang(self, lang_code):
+        for voice_name, voice_data in VOICE_PRESETS.items():
+            if voice_data['lang'] == lang_code:
+                self.current_voice = voice_name
+                self.voice_params = voice_data.copy()
+                return True
+        return False
+    
     def speak(self, text):
         try:
             tts = gTTS(
@@ -156,29 +164,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     current_voice = VOICE_PRESETS[tts_bot.current_voice]['name']
+    current_lang = VOICE_PRESETS[tts_bot.current_voice]['lang']
     
     await update.message.reply_text(
         f"Google TTS Bot\n\n"
         f"Current voice: {current_voice}\n"
-        f"Language: {tts_bot.voice_params['lang']}\n"
+        f"Language: {current_lang}\n"
         f"Slow mode: {tts_bot.voice_params['slow']}\n\n"
-        f"Use /gsay [text] to speak\n"
-        f"Example: /gsay Hello world\n\n"
+        f"Commands:\n"
+        f"/gsay [text] - Speak text\n"
+        f"/lang [code] - Change language\n"
+        f"/voice [name] - Change voice\n"
+        f"/start - Main menu\n"
+        f"/help - Help\n\n"
+        f"Example: /gsay Hello world\n"
+        f"Example: /lang ru\n"
+        f"Example: /voice sam\n\n"
         f"Select voice from buttons below:",
         reply_markup=reply_markup
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    voices_list = "\n".join([f"- {k}: {v['name']}" for k, v in VOICE_PRESETS.items()])
+    langs = {}
+    for k, v in VOICE_PRESETS.items():
+        langs[v['lang']] = True
+    langs_list = "\n".join([f"- {lang}" for lang in sorted(langs.keys())])
+    
     await update.message.reply_text(
-        "Help\n\n"
-        "Commands:\n"
-        "/gsay [text] - Speak text\n"
-        "   Example: /gsay Hello world\n"
-        "/start - Main menu\n"
-        "/help - This help\n\n"
-        "Available voices:\n"
-        + "\n".join([f"- {v['name']}" for k, v in VOICE_PRESETS.items()])
+        f"Help\n\n"
+        f"Commands:\n"
+        f"/gsay [text] - Speak text\n"
+        f"   Example: /gsay Hello world\n"
+        f"/lang [code] - Change language\n"
+        f"   Example: /lang ru\n"
+        f"/voice [name] - Change voice\n"
+        f"   Example: /voice sam\n"
+        f"/start - Main menu\n"
+        f"/help - This help\n\n"
+        f"Available voices:\n{voices_list}\n\n"
+        f"Available languages:\n{langs_list}"
     )
 
 
@@ -202,6 +228,42 @@ async def gsay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Error generating audio")
 
 
+async def lang_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            f"Current language: {tts_bot.voice_params['lang']}\n"
+            f"Use /lang [code] to change\n"
+            f"Available: ru, en, fr, de, es, it, ja, zh"
+        )
+        return
+    
+    lang_code = context.args[0].lower()
+    if tts_bot.set_lang(lang_code):
+        voice_name = VOICE_PRESETS[tts_bot.current_voice]['name']
+        await update.message.reply_text(f"Language changed to: {lang_code}\nVoice: {voice_name}")
+    else:
+        await update.message.reply_text(f"Language '{lang_code}' not found. Available: ru, en, fr, de, es, it, ja, zh")
+
+
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        voices_list = "\n".join([f"- {k}: {v['name']}" for k, v in VOICE_PRESETS.items()])
+        await update.message.reply_text(
+            f"Current voice: {VOICE_PRESETS[tts_bot.current_voice]['name']}\n\n"
+            f"Available voices:\n{voices_list}\n\n"
+            f"Use /voice [name] to change\n"
+            f"Example: /voice sam"
+        )
+        return
+    
+    voice_name = context.args[0].lower()
+    if tts_bot.set_voice(voice_name):
+        voice_display = VOICE_PRESETS[voice_name]['name']
+        await update.message.reply_text(f"Voice changed to: {voice_display}")
+    else:
+        await update.message.reply_text(f"Voice '{voice_name}' not found. Use /voice to see all")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text.startswith('/'):
@@ -220,14 +282,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data == "help":
+        voices_list = "\n".join([f"- {k}: {v['name']}" for k, v in VOICE_PRESETS.items()])
         await query.edit_message_text(
-            "Help\n\n"
-            "Use /gsay [text] to speak\n\n"
-            "Commands:\n"
-            "/gsay [text] - Speak\n"
-            "/start - Menu\n"
-            "/help - Help\n\n"
-            "Select voice from menu",
+            f"Help\n\n"
+            f"Commands:\n"
+            f"/gsay [text] - Speak\n"
+            f"/lang [code] - Change language\n"
+            f"/voice [name] - Change voice\n"
+            f"/start - Menu\n"
+            f"/help - Help\n\n"
+            f"Available voices:\n{voices_list}\n\n"
+            f"Press Back to return",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="back")]])
         )
         return
@@ -253,6 +318,8 @@ def main():
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("gsay", gsay_command))
+        application.add_handler(CommandHandler("lang", lang_command))
+        application.add_handler(CommandHandler("voice", voice_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
@@ -260,6 +327,8 @@ def main():
             ("start", "Menu"),
             ("help", "Help"),
             ("gsay", "Say text"),
+            ("lang", "Change language"),
+            ("voice", "Change voice"),
         ]
         application.bot.set_my_commands(commands)
         
@@ -267,7 +336,7 @@ def main():
         print("\n" + "="*50)
         print("Google TTS Bot started!")
         print(f"Available voices: {len(VOICE_PRESETS)}")
-        print("Use /gsay [text] to speak")
+        print("Commands: /gsay, /lang, /voice, /start, /help")
         print("="*50 + "\n")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
