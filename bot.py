@@ -19,7 +19,7 @@ except ImportError:
 # ============================================================
 # КОНФИГ
 # ============================================================
-TELEGRAM_TOKEN = "8931135477:AAGkh2HUo2bE2OKiGO0t8fIN3iajV2tIeMY"  # ЗАМЕНИ НА НОВЫЙ
+TELEGRAM_TOKEN = "8977465569:AAG_QyZWqrHCS7IELGmNqDp2nb5-Ln6v6b8"  # ЗАМЕНИ НА НОВЫЙ
 HF_TOKEN = os.getenv("HF_TOKEN", "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")
 
 logging.basicConfig(
