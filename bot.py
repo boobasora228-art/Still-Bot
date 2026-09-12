@@ -1,7 +1,7 @@
 import asyncio
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
 from g4f.client import AsyncClient
 from g4f.Provider import HuggingFaceMedia
 
@@ -15,6 +15,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
 # Асинхронные клиенты G4F
 g4f_client = AsyncClient()
 hf_client = AsyncClient(provider=HuggingFaceMedia, api_key=HF_TOKEN)
@@ -22,15 +25,15 @@ hf_client = AsyncClient(provider=HuggingFaceMedia, api_key=HF_TOKEN)
 # Хранилище: {"gpt4": ("chat", "gpt-4"), "flux": ("image", "flux"), ...}
 COMMAND_MAP = {}
 
-# Список всех текстовых моделей из g4f (для команды /model)
+# Списки моделей
 TEXT_MODELS = []
 IMAGE_MODELS = []
-VIDEO_MODELS = []
+VIDEO_MODELS = ["sora", "veo"]
 
 
 async def build_commands():
     """Собирает команды из доступных моделей G4F. Не падает при ошибке."""
-    global COMMAND_MAP, TEXT_MODELS, IMAGE_MODELS, VIDEO_MODELS
+    global COMMAND_MAP, TEXT_MODELS, IMAGE_MODELS
     COMMAND_MAP = {}
 
     # === Текстовые модели ===
@@ -58,14 +61,14 @@ async def build_commands():
         COMMAND_MAP[cmd] = ("image", m)
 
     # === Видео модели ===
-    VIDEO_MODELS = ["sora", "veo"]
-    COMMAND_MAP["sora"] = ("video", "sora")
-    COMMAND_MAP["veo"] = ("video", "veo")
+    for m in VIDEO_MODELS:
+        COMMAND_MAP[m] = ("video", m)
 
     logger.info(f"Итого команд: {len(COMMAND_MAP)}")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
     """Приветствие со списком команд."""
     lines = ["Привет! Я BurmaldaAI.\n"]
 
@@ -83,10 +86,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("\nИспользуй /model чтобы выбрать модель.")
     lines.append("Лучше писать на английском для лучших результатов.")
 
-    await update.message.reply_text("\n".join(lines))
+    await message.answer("\n".join(lines))
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
     """Информация о боте и рекомендация писать на английском."""
     text = (
         "BurmaldaAI — бот с доступом к бесплатным ИИ-моделям.\n\n"
@@ -102,13 +106,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Важно: большинство моделей лучше работают с запросами "
         "на английском языке. Пиши на русском только если модель это поддерживает."
     )
-    await update.message.reply_text(text)
+    await message.answer(text)
 
 
-async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@dp.message(Command("model"))
+async def cmd_model(message: types.Message):
     """Показывает доступные модели для выбора."""
     # Если аргументы не переданы — показываем список
-    if not context.args:
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
         lines = ["Доступные модели:\n"]
 
         lines.append("Текст:")
@@ -126,41 +132,42 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lines.append(f"  /{m}")
 
         lines.append("\nПример: /model gpt4")
-        await update.message.reply_text("\n".join(lines))
+        await message.answer("\n".join(lines))
         return
 
     # Если пользователь указал модель — подтверждаем
-    model_name = context.args[0].lower()
+    model_name = args[1].lower()
     if model_name in COMMAND_MAP:
         kind, real_model = COMMAND_MAP[model_name]
-        await update.message.reply_text(
+        await message.answer(
             f"Модель: {real_model}\nТип: {kind}\n"
             f"Используй: /{model_name} твой запрос"
         )
     else:
-        await update.message.reply_text(f"Модель {model_name} не найдена. Используй /model для списка.")
+        await message.answer(f"Модель {model_name} не найдена. Используй /model для списка.")
 
 
-async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@dp.message(F.text.startswith("/"))
+async def handle_command(message: types.Message):
     """Универсальный обработчик для всех динамических команд."""
-    prompt = " ".join(context.args) if context.args else None
+    parts = message.text[1:].split(maxsplit=1)
+    cmd = parts[0].lower()
+    prompt = parts[1] if len(parts) > 1 else None
 
-    if not update.message or not update.message.text:
+    # Пропускаем стандартные команды
+    if cmd in ("start", "help", "model"):
         return
 
-    parts = update.message.text[1:].split(maxsplit=1)
-    cmd = parts[0].lower()
-
     if cmd not in COMMAND_MAP:
-        await update.message.reply_text(f"Неизвестная команда: /{cmd}. Напиши /start для списка.")
+        await message.answer(f"Неизвестная команда: /{cmd}. Напиши /start для списка.")
         return
 
     if not prompt:
-        await update.message.reply_text(f"Использование: /{cmd} ваш запрос")
+        await message.answer(f"Использование: /{cmd} ваш запрос")
         return
 
     kind, model = COMMAND_MAP[cmd]
-    status_msg = await update.message.reply_text(f"Генерирую через {model}...")
+    status_msg = await message.answer(f"Генерирую через {model}...")
 
     try:
         if kind == "chat":
@@ -179,7 +186,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             url = response.data[0].url
             await status_msg.delete()
-            await update.message.reply_photo(url, caption=model)
+            await message.answer_photo(url, caption=model)
 
         elif kind == "video":
             result = await hf_client.media.generate(
@@ -189,32 +196,22 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             video_url = result.data[0].url
             await status_msg.delete()
-            await update.message.reply_video(video_url, caption=model)
+            await message.answer_video(video_url, caption=model)
 
     except Exception as e:
         logger.exception(f"Ошибка генерации для {model}: {e}")
         await status_msg.edit_text(f"Ошибка: {str(e)[:500]}")
 
 
-async def main() -> None:
+async def main():
     """Точка входа."""
     logger.info("=== СТАРТ БОТА ===")
 
     await build_commands()
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Стандартные команды
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("model", model_command))
-
-    # Универсальный обработчик для всех динамических команд
-    all_cmds = list(COMMAND_MAP.keys()) + ["start", "help", "model"]
-    application.add_handler(CommandHandler(all_cmds, handle_command))
-
     logger.info("Запускаю polling...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ВАЖНО: allowed_updates=Update.ALL_TYPES — чтобы ловить все типы обновлений
+    await dp.start_polling(bot, allowed_updates=types.Update.model_fields.keys())
     logger.info("=== БОТ ОСТАНОВЛЕН ===")
 
 
