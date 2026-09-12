@@ -1,5 +1,5 @@
 aiogram==3.4.1
-g4f==0.3.9.7
+g4f
 huggingface_hub
 aiohttp
 curl_cffi==0.6.3b1
