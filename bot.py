@@ -19,73 +19,132 @@ logger = logging.getLogger(__name__)
 g4f_client = AsyncClient()
 hf_client = AsyncClient(provider=HuggingFaceMedia, api_key=HF_TOKEN)
 
-# Хранилище активных команд: { "gpt35turbo": ("chat", "gpt-3.5-turbo"), ... }
+# Хранилище: {"gpt4": ("chat", "gpt-4"), "flux": ("image", "flux"), ...}
 COMMAND_MAP = {}
+
+# Список всех текстовых моделей из g4f (для команды /model)
+TEXT_MODELS = []
+IMAGE_MODELS = []
+VIDEO_MODELS = []
 
 
 async def build_commands():
     """Собирает команды из доступных моделей G4F. Не падает при ошибке."""
-    global COMMAND_MAP
+    global COMMAND_MAP, TEXT_MODELS, IMAGE_MODELS, VIDEO_MODELS
     COMMAND_MAP = {}
 
-    # Текстовые модели
+    # === Текстовые модели ===
     try:
-        models = g4f_client.models.get_all()
-        for m in models:
-            cmd = m.replace("-", "").replace(".", "").replace("_", "").lower()
-            COMMAND_MAP[cmd] = ("chat", m)
-        logger.info(f"Загружено текстовых моделей: {len(models)}")
+        TEXT_MODELS = g4f_client.models.get_all()
+        logger.info(f"Загружено текстовых моделей: {len(TEXT_MODELS)}")
     except Exception as e:
         logger.exception(f"Ошибка загрузки текстовых моделей: {e}")
-        # Фоллбэк
-        COMMAND_MAP["gpt35turbo"] = ("chat", "gpt-3.5-turbo")
-        COMMAND_MAP["gpt4"] = ("chat", "gpt-4")
+        TEXT_MODELS = ["gpt-4", "gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini"]
 
-    # Модели для картинок
+    for m in TEXT_MODELS:
+        cmd = m.replace("-", "").replace(".", "").replace("_", "").lower()
+        COMMAND_MAP[cmd] = ("chat", m)
+
+    # === Модели для картинок ===
     try:
-        img_models = g4f_client.models.get_image()
-        for m in img_models:
-            cmd = m.replace("-", "").replace(".", "").replace("_", "").lower()
-            COMMAND_MAP[cmd] = ("image", m)
-        logger.info(f"Загружено моделей для картинок: {len(img_models)}")
+        IMAGE_MODELS = g4f_client.models.get_image()
+        logger.info(f"Загружено моделей для картинок: {len(IMAGE_MODELS)}")
     except Exception as e:
         logger.exception(f"Ошибка загрузки моделей для картинок: {e}")
-        COMMAND_MAP["gptimg2"] = ("image", "dall-e-3")
-        COMMAND_MAP["flux"] = ("image", "flux")
+        IMAGE_MODELS = ["dall-e-3", "flux", "sdxl"]
 
-    # Видео модели (только доступные через HF)
-    COMMAND_MAP["sora"] = ("video", "sora-2")
-    COMMAND_MAP["veo"] = ("video", "veo-3.1-fast")
+    for m in IMAGE_MODELS:
+        cmd = m.replace("-", "").replace(".", "").replace("_", "").lower()
+        COMMAND_MAP[cmd] = ("image", m)
+
+    # === Видео модели ===
+    VIDEO_MODELS = ["sora", "veo"]
+    COMMAND_MAP["sora"] = ("video", "sora")
+    COMMAND_MAP["veo"] = ("video", "veo")
 
     logger.info(f"Итого команд: {len(COMMAND_MAP)}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет приветствие со списком команд."""
-    lines = ["Привет! Доступные команды:\n"]
+    """Приветствие со списком команд."""
+    lines = ["Привет! Я BurmaldaAI.\n"]
 
     text_cmds = [c for c, (t, _) in COMMAND_MAP.items() if t == "chat"]
     img_cmds = [c for c, (t, _) in COMMAND_MAP.items() if t == "image"]
     vid_cmds = [c for c, (t, _) in COMMAND_MAP.items() if t == "video"]
 
     if text_cmds:
-        lines.append(f"Текст: {', '.join('/' + c for c in text_cmds[:20])}")
+        lines.append(f"Текст: {', '.join('/' + c for c in text_cmds[:15])}")
     if img_cmds:
         lines.append(f"Картинки: {', '.join('/' + c for c in img_cmds)}")
     if vid_cmds:
         lines.append(f"Видео: {', '.join('/' + c for c in vid_cmds)}")
 
+    lines.append("\nИспользуй /model чтобы выбрать модель.")
+    lines.append("Лучше писать на английском для лучших результатов.")
+
     await update.message.reply_text("\n".join(lines))
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Информация о боте и рекомендация писать на английском."""
+    text = (
+        "BurmaldaAI — бот с доступом к бесплатным ИИ-моделям.\n\n"
+        "Доступные типы моделей:\n"
+        "• Текст — GPT-4, GPT-3.5, Llama, Claude и другие\n"
+        "• Картинки — DALL-E, Flux, SDXL и другие\n"
+        "• Видео — Sora, Veo\n\n"
+        "Как использовать:\n"
+        "• /gpt4 привет — генерация текста\n"
+        "• /flux кот — генерация картинки\n"
+        "• /sora город — генерация видео\n"
+        "• /model — выбрать модель из списка\n\n"
+        "Важно: большинство моделей лучше работают с запросами "
+        "на английском языке. Пиши на русском только если модель это поддерживает."
+    )
+    await update.message.reply_text(text)
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает доступные модели для выбора."""
+    # Если аргументы не переданы — показываем список
+    if not context.args:
+        lines = ["Доступные модели:\n"]
+
+        lines.append("Текст:")
+        for m in TEXT_MODELS[:20]:
+            cmd = m.replace("-", "").replace(".", "").replace("_", "").lower()
+            lines.append(f"  /{cmd}")
+
+        lines.append("\nКартинки:")
+        for m in IMAGE_MODELS[:10]:
+            cmd = m.replace("-", "").replace(".", "").replace("_", "").lower()
+            lines.append(f"  /{cmd}")
+
+        lines.append("\nВидео:")
+        for m in VIDEO_MODELS:
+            lines.append(f"  /{m}")
+
+        lines.append("\nПример: /model gpt4")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # Если пользователь указал модель — подтверждаем
+    model_name = context.args[0].lower()
+    if model_name in COMMAND_MAP:
+        kind, real_model = COMMAND_MAP[model_name]
+        await update.message.reply_text(
+            f"Модель: {real_model}\nТип: {kind}\n"
+            f"Используй: /{model_name} твой запрос"
+        )
+    else:
+        await update.message.reply_text(f"Модель {model_name} не найдена. Используй /model для списка.")
 
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Универсальный обработчик для всех динамических команд."""
-    # context.args — это список аргументов после команды
-    # Например, для "/gpt4 привет мир" это будет ["привет", "мир"]
     prompt = " ".join(context.args) if context.args else None
 
-    # Извлекаем имя команды из текста сообщения (без слэша)
-    # context.args не содержит саму команду, поэтому парсим текст
     if not update.message or not update.message.text:
         return
 
@@ -141,22 +200,18 @@ async def main() -> None:
     """Точка входа."""
     logger.info("=== СТАРТ БОТА ===")
 
-    # Загружаем команды (не падаем при ошибке)
     await build_commands()
 
-    # Создаём Application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Регистрируем /start
+    # Стандартные команды
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("model", model_command))
 
-    # Регистрируем универсальный обработчик для всех остальных команд
-    # Используем filters.COMMAND, чтобы он ловил только команды
-    from telegram.ext import filters
-    application.add_handler(CommandHandler(
-        list(COMMAND_MAP.keys()),  # список имён команд без слэша
-        handle_command
-    ))
+    # Универсальный обработчик для всех динамических команд
+    all_cmds = list(COMMAND_MAP.keys()) + ["start", "help", "model"]
+    application.add_handler(CommandHandler(all_cmds, handle_command))
 
     logger.info("Запускаю polling...")
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
