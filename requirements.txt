@@ -3,3 +3,5 @@ g4f
 huggingface_hub
 aiohttp
 curl_cffi==0.6.3b1
+Pillow
+moviepy
